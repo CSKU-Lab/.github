@@ -1,0 +1,77 @@
+name: Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      docker_workflow:
+        description: Filename of the docker publish workflow to trigger
+        required: false
+        type: string
+        default: docker-publish.yml
+    secrets:
+      SEMANTIC_RELEASE_APP_ID:
+        required: true
+      SEMANTIC_RELEASE_PRIVATE_KEY:
+        required: true
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Generate app token
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+
+      - name: Get current latest tag
+        id: pre_release
+        run: echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          npx --package semantic-release@24 \
+              --package @semantic-release/changelog@6 \
+              --package @semantic-release/git@10 \
+              --package @semantic-release/github@11 \
+              --package @semantic-release/commit-analyzer@13 \
+              --package @semantic-release/release-notes-generator@14 \
+              semantic-release
+
+      - name: Check for new release
+        id: post_release
+        run: |
+          git fetch --tags
+          NEW_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          OLD_TAG="${{ steps.pre_release.outputs.tag }}"
+          if [ -n "$NEW_TAG" ] && [ "$NEW_TAG" != "$OLD_TAG" ]; then
+            echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "released=true" >> $GITHUB_OUTPUT
+          else
+            echo "released=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger Docker build
+        if: steps.post_release.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: gh workflow run ${{ inputs.docker_workflow }} --ref ${{ steps.post_release.outputs.new_tag }}

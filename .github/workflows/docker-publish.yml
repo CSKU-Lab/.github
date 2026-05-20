@@ -1,0 +1,146 @@
+name: Docker Build and Publish (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Primary Docker image name (without registry prefix)
+        required: true
+        type: string
+      dockerfile_path:
+        required: false
+        type: string
+        default: Dockerfile
+      context_path:
+        required: false
+        type: string
+        default: .
+      secondary_image_name:
+        description: Second image name — used when a service builds multiple images
+        required: false
+        type: string
+        default: ''
+      secondary_dockerfile_path:
+        required: false
+        type: string
+        default: ''
+      gitops_paths:
+        description: Space-separated list of env.libsonnet paths to update in gitops repo
+        required: true
+        type: string
+      service_name:
+        description: Service name used in the gitops commit message
+        required: true
+        type: string
+      platforms:
+        required: false
+        type: string
+        default: linux/amd64
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_TOKEN:
+        required: true
+      LABBY_APP_ID:
+        required: true
+      LABBY_PRIVATE_KEY:
+        required: true
+
+jobs:
+  build-and-push:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Extract metadata (primary)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}
+          tags: |
+            type=raw,value=latest
+            type=ref,event=tag
+
+      - name: Build and push primary image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Extract metadata (secondary)
+        id: meta-secondary
+        if: inputs.secondary_image_name != ''
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.secondary_image_name }}
+          tags: |
+            type=raw,value=latest
+            type=ref,event=tag
+
+      - name: Build and push secondary image
+        if: inputs.secondary_image_name != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.secondary_dockerfile_path }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta-secondary.outputs.tags }}
+          labels: ${{ steps.meta-secondary.outputs.labels }}
+
+  update-gitops:
+    name: Update GitOps
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+    steps:
+      - name: Generate labby token
+        id: labby
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.LABBY_APP_ID }}
+          private-key: ${{ secrets.LABBY_PRIVATE_KEY }}
+          owner: CSKU-Lab
+          repositories: gitops
+
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          repository: CSKU-Lab/gitops
+          token: ${{ steps.labby.outputs.token }}
+
+      - name: Update image tags
+        run: |
+          for path in ${{ inputs.gitops_paths }}; do
+            sed -i "s/imageTag: '.*'/imageTag: '${{ github.ref_name }}'/" "$path"
+          done
+
+      - name: Commit and push
+        run: |
+          git config user.name "labby[bot]"
+          git config user.email "labby[bot]@users.noreply.github.com"
+          git add ${{ inputs.gitops_paths }}
+          git commit -m "chore(${{ inputs.service_name }}): update image tag to ${{ github.ref_name }}"
+          git push
